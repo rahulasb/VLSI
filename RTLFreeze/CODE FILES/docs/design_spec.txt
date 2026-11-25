@@ -1,0 +1,194 @@
+8-Bit Fully Connected Neural Network Inference Accelerator
+RTL Design Specification
+
+1. Architecture
+- One fully connected layer.
+- Eight inputs and four output neurons.
+- Four parallel multiply-accumulate (MAC) lanes.
+- Each lane computes one neuron across eight input values.
+- Inputs, weights, biases, and outputs use register storage.
+
+2. Data Widths
+- Inputs: signed 8-bit, range -128 to 127.
+- Weights: signed 8-bit, range -128 to 127.
+- Biases: signed 16-bit, range -32768 to 32767.
+- Products: signed 16-bit.
+- Accumulators: signed 24-bit.
+- Outputs: unsigned 8-bit, range 0 to 255.
+
+3. Computation
+For each neuron j = 0, 1, 2, 3:
+
+sum[j] = bias[j] + sum of input[i] * weight[j][i]
+         for i = 0 through 7.
+
+Sign-extend each product and bias to 24 bits before addition.
+Add each bias exactly once per inference.
+
+4. Output Processing
+- Apply a fixed arithmetic right shift of 7 bits.
+- Discard fractional bits; do not round.
+- Apply ReLU: negative values become zero.
+- Saturate values greater than 255 to 255.
+- Store the resulting unsigned 8-bit output.
+
+Equivalent expression:
+
+output[j] = min(255, max(0, sum[j] >>> 7))
+
+5. Verification
+- Verify signed MAC arithmetic independently.
+- Verify rescaling, ReLU, and saturation boundaries.
+- Verify parameter loading through the external interface.
+- Compare all four inference outputs with a reference model.
+- Test reset, parameter reload, and repeated inference.
+
+6. External Interface
+All inputs are synchronous to clk. The external source must
+provide signals that meet the clock's setup and hold requirements.
+
+Port        Direction   Width   Description
+clk         Input       1       System clock.
+resetn      Input       1       Synchronous active-low reset.
+wr_en       Input       1       Register write enable.
+addr        Input       6       Write address, range 0 through 63.
+data_in     Input       8       Input or parameter byte to write.
+start       Input       1       Request a new inference.
+out_sel     Input       2       Select output neuron 0 through 3.
+data_out    Output      8       Selected unsigned output value.
+busy        Output      1       Inference is in progress.
+done        Output      1       An inference has completed.
+
+The interface uses 30 signal pins in total.
+
+7. Write Address Map
+Addresses are decimal.
+
+0 through 7:
+  Input registers input[0] through input[7].
+
+8 through 15:
+  Weights weight[0][0] through weight[0][7].
+
+16 through 23:
+  Weights weight[1][0] through weight[1][7].
+
+24 through 31:
+  Weights weight[2][0] through weight[2][7].
+
+32 through 39:
+  Weights weight[3][0] through weight[3][7].
+
+40: bias[0] low byte, bits [7:0].
+41: bias[0] high byte, bits [15:8].
+42: bias[1] low byte.
+43: bias[1] high byte.
+44: bias[2] low byte.
+45: bias[2] high byte.
+46: bias[3] low byte.
+47: bias[3] high byte.
+
+48 through 63:
+  Reserved. Writes have no effect.
+
+General address expressions:
+  Input i:           i
+  Weight neuron j,
+  input index i:     8 + 8*j + i
+  Bias neuron j,
+  low byte:          40 + 2*j
+  Bias neuron j,
+  high byte:         41 + 2*j
+
+Inputs, weights, and biases use two's-complement representation.
+Each bias is assembled from two bytes into a signed 16-bit value.
+Writing one bias byte preserves the other byte.
+
+8. Reset Behavior
+Reset is sampled on each rising clock edge.
+
+When resetn is low:
+- Clear all input, weight, bias, and output registers.
+- Clear all accumulators and the input-index counter.
+- Return the controller to its idle state.
+- Set busy to zero.
+- Set done to zero.
+- Abort any inference in progress.
+- Ignore start and writes.
+
+Hold resetn low across at least one rising clock edge.
+
+9. Loading and Start Behavior
+Writes are accepted on rising clock edges only when:
+  resetn = 1, busy = 0, start = 0, and wr_en = 1.
+
+One byte is written per accepted clock edge.
+
+A start request is accepted on a rising clock edge when:
+  resetn = 1, busy = 0, and start = 1.
+
+An accepted start has priority over a write.
+If start and wr_en are both high while idle:
+- Begin inference using the previously stored values.
+- Do not perform the write on that edge.
+
+On an accepted start:
+- Load each accumulator with its sign-extended bias.
+- Set the input-index counter to zero.
+- Set busy to one.
+- Clear done.
+- Preserve the previous output values.
+
+During busy:
+- Ignore writes.
+- Ignore additional start requests.
+- Continue the current inference.
+
+The external source should pulse start for one clock cycle.
+Complete all required loading before the start edge.
+There is no automatic check that all parameters have been loaded.
+Unwritten registers retain their reset or previously loaded values.
+
+10. Computation Timing
+Let E0 be the rising edge that accepts start.
+
+E0:
+  Initialize the four accumulators with their biases.
+  Assert busy and clear done.
+
+E1 through E8:
+  Process input indices 0 through 7, respectively.
+  On each edge, all four MAC lanes add their signed products.
+
+E9:
+  Rescale, apply ReLU, and saturate the completed sums.
+  Update all four output registers together.
+  Deassert busy.
+  Assert done.
+  Return the controller to idle.
+
+Latency from accepted start to valid new results:
+  Nine clock periods.
+
+Start and writes are still ignored on E9 because the
+accelerator was busy before that edge.
+The earliest next accepted start or write is E10.
+
+11. Completion and Readback
+Done remains high until reset or the next accepted start.
+Parameter writes do not clear done.
+
+data_out continuously selects one stored output:
+  out_sel = 0: output[0].
+  out_sel = 1: output[1].
+  out_sel = 2: output[2].
+  out_sel = 3: output[3].
+
+Changing out_sel does not require a clock edge.
+Allow combinational propagation time before sampling data_out.
+
+Output registers retain their values during loading and inference.
+They change only on reset or when an inference completes.
+
+Inputs, weights, and biases remain stored after inference,
+allowing repeated inference without reloading unchanged values.
